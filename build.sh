@@ -1,0 +1,1 @@
+g++ run-node.cpp -std=c++17 -lssl -lcrypto -lpthread -o run-node
