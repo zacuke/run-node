@@ -101,63 +101,97 @@ std::string https_get_string(const std::string& host, const std::string& target)
 int main(int argc, char* argv[])
 {
     try {
-        fs::path tmp = fs::temp_directory_path() / "node-bootstrap";
-        fs::create_directories(tmp);
+        // Use per-project `.node` directory
+        fs::path projectRoot = fs::current_path();
+        fs::path nodeDir = projectRoot / ".node";
+        fs::create_directories(nodeDir);
 
-        // 1. Fetch index.json
-        std::cout << "Fetching Node.js versions index...\n";
+        fs::path versionFile = nodeDir / "version.txt";
+
         std::string jsonStr = https_get_string("nodejs.org", "/dist/index.json");
-
-        // 2. Parse it
         std::stringstream ss(jsonStr);
         boost::property_tree::ptree pt;
         boost::property_tree::read_json(ss, pt);
 
-        std::string version;
-        for (auto &entry : pt) {
-            auto &obj = entry.second;
+        std::string targetVersion;
+        int cachedMajor = -1;
+        if (fs::exists(versionFile)) {
+            std::ifstream fin(versionFile);
+            fin >> cachedMajor;
+            std::cout << "Cached major version: " << cachedMajor << "\n";
+        }
+
+        for (auto& entry : pt) {
+            auto& obj = entry.second;
             try {
                 bool isLTS = !obj.get<std::string>("lts").empty();
                 if (isLTS) {
-                    version = obj.get<std::string>("version");
-                    break; // latest LTS is first
+                    std::string v = obj.get<std::string>("version"); // e.g. "v20.11.1"
+                    int major = std::stoi(v.substr(1, v.find('.', 1) - 1));
+
+                    if (cachedMajor == -1) {
+                        // First run: pick newest LTS major
+                        targetVersion = v;
+                        cachedMajor = major;
+
+                        std::ofstream fout(versionFile);
+                        fout << major;
+                        break;
+                    } else if (major == cachedMajor) {
+                        // Subsequent run: stick to cached major
+                        targetVersion = v;
+                        break;
+                    }
                 }
-            } catch(...) {}
+            } catch (...) {}
         }
-        if (version.empty()) {
-            std::cerr << "No LTS found\n";
+
+        if (targetVersion.empty()) {
+            std::cerr << "No suitable Node.js LTS found.\n";
             return 1;
         }
+        std::cout << "Using Node.js version: " << targetVersion << "\n";
 
-        std::cout << "Latest LTS = " << version << "\n";
+        std::string filename = "node-" + targetVersion + "-linux-x64.tar.xz";
+        std::string target = "/dist/" + targetVersion + "/" + filename;
 
-        // 3. Build URL and download archive
-        std::string filename = "node-" + version + "-linux-x64.tar.xz";
-        std::string target = "/dist/" + version + "/" + filename;
-        fs::path archivePath = tmp / filename;
-
-        std::cout << "Downloading: " << target << "\n";
-        https_download("nodejs.org", target, archivePath);
-
-        // 4. Extract using system tar (quick integration)
-        fs::path extractDir = tmp / "node";
-        fs::create_directories(extractDir);
-
-        std::string tarCmd = "tar -xf " + archivePath.string() + " -C " +
-                             extractDir.string() + " --strip-components=1";
-        if (system(tarCmd.c_str()) != 0) {
-            std::cerr << "Extraction failed\n";
-            return 1;
+        fs::path archivePath = nodeDir / filename;
+        if (!fs::exists(archivePath)) {
+            std::cout << "Downloading " << target << "\n";
+            https_download("nodejs.org", target, archivePath);
         }
 
-        // 5. Path to node
+        // Extracted version directory
+        fs::path versionsDir = nodeDir / "versions";
+        fs::path extractDir = versionsDir / targetVersion;
         fs::path nodeBin = extractDir / "bin" / "node";
+
+        if (!fs::exists(nodeBin)) {
+            fs::create_directories(versionsDir);
+            std::cout << "Extracting to " << extractDir << "\n";
+
+            fs::create_directories(extractDir);
+            std::string tarCmd = "tar -xf " + archivePath.string() +
+                                 " -C " + extractDir.string() + " --strip-components=1";
+            if (system(tarCmd.c_str()) != 0) {
+                std::cerr << "Extraction failed\n";
+                return 1;
+            }
+        } else {
+            std::cout << "Using cached extraction: " << extractDir << "\n";
+        }
+
+        // Update symlink `.node/current` → this version
+        fs::path currentLink = nodeDir / "current";
+        if (fs::exists(currentLink))
+            fs::remove(currentLink);
+        fs::create_symlink(extractDir, currentLink);
+
         if (!fs::exists(nodeBin)) {
             std::cerr << "Node binary not found\n";
             return 1;
         }
 
-        // 6. Exec into node with args
         if (argc < 2) {
             std::cerr << "Usage: " << argv[0] << " <args to node>\n";
             return 1;
@@ -169,13 +203,14 @@ int main(int argc, char* argv[])
             newArgs.push_back(argv[i]);
         newArgs.push_back(nullptr);
 
-        std::cout << "Running: " << nodeBin << "\n";
+        std::cout << "Running " << nodeBin << "\n";
         execv(nodeBin.c_str(), newArgs.data());
 
         perror("execv failed");
         return 1;
     }
-    catch(std::exception const& e) {
+    catch(const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";
+        return 1;
     }
 }
