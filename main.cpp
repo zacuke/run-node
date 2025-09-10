@@ -10,9 +10,44 @@
 #include <fstream>
 #include <vector>
 #include <unistd.h>
+#include <sys/wait.h>
 
-namespace fs   = std::filesystem;
- 
+namespace fs = std::filesystem;
+
+// -------------------------------------------------------------------
+// Run `corepack install` using the Node.js distribution we installed
+// -------------------------------------------------------------------
+bool run_corepack_install(const fs::path& projectNodeBin, const fs::path& projectNodeDir)
+{
+    // corepack.js lives inside lib/node_modules/corepack/dist
+    fs::path corepackJs = projectNodeDir / "lib" / "node_modules" / "corepack" / "dist" / "corepack.js";
+    if (!fs::exists(corepackJs)) {
+        std::cerr << "corepack.js not found at " << corepackJs << "\n";
+        return false;
+    }
+
+    std::cout << "Running corepack install with our Node...\n";
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        char* args[] = {
+            const_cast<char*>(projectNodeBin.c_str()),                 // our node binary
+            const_cast<char*>(corepackJs.c_str()),                     // path to corepack.js
+            const_cast<char*>("install"),
+            nullptr
+        };
+        execv(projectNodeBin.c_str(), args);
+        perror("execv corepack.js failed");
+        _exit(127);
+    }
+    int status;
+    if (waitpid(pid, &status, 0) < 0) {
+        perror("waitpid failed");
+        return false;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
 // -------------------------------------------------------------------
 // Main
 // -------------------------------------------------------------------
@@ -119,11 +154,21 @@ int main(int argc, char* argv[])
             return 1;
         }
 
+        // --- Always run corepack install if package.json exists ---
+        fs::path pkgJson = projectRoot / "package.json";
+        if (fs::exists(pkgJson)) {
+            if (!run_corepack_install(projectNodeBin, projectNodeDir)) {
+                std::cerr << "corepack install failed\n";
+                return 1;
+            }
+        }
+
         if (argc < 2) {
             std::cerr << "Usage: " << argv[0] << " <args to node>\n";
             return 1;
         }
 
+        // Build argv for execv
         std::vector<char*> newArgs;
         newArgs.push_back(const_cast<char*>(projectNodeBin.c_str()));
         for (int i = 1; i < argc; i++)
