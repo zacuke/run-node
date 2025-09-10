@@ -16,15 +16,15 @@
 #include <vector>
 #include <unistd.h>
 
-namespace fs = std::filesystem;
-namespace beast = boost::beast;
+namespace fs   = std::filesystem;
+namespace beast= boost::beast;
 namespace http = beast::http;
-namespace net = boost::asio;
-namespace ssl = boost::asio::ssl;
+namespace net  = boost::asio;
+namespace ssl  = boost::asio::ssl;
 using tcp = net::ip::tcp;
 
 // -------------------------------------------------------------------
-// Downloader functions
+// HTTPS Download Helpers
 // -------------------------------------------------------------------
 void https_download(const std::string& host, const std::string& target, const fs::path& outFile)
 {
@@ -89,7 +89,6 @@ std::string https_get_string(const std::string& host, const std::string& target)
     http::read(stream, buffer, parser);
 
     http::response<http::dynamic_body> res = parser.release();
-
     std::string body;
     for (auto const& b : res.body().data())
         body.append(static_cast<const char*>(b.data()), b.size());
@@ -115,7 +114,7 @@ bool extract_tar_xz(const std::string& archivePath, const std::string& destDir) 
     archive_read_support_filter_xz(a);
     archive_read_support_format_tar(a);
 
-    if ((r = archive_read_open_filename(a, archivePath.c_str(), 10240))) {
+    if ((r = archive_read_open_filename(a, archivePath.c_str(), 10240)) != ARCHIVE_OK) {
         std::cerr << "archive_read_open_filename failed: "
                   << archive_error_string(a) << "\n";
         return false;
@@ -124,7 +123,7 @@ bool extract_tar_xz(const std::string& archivePath, const std::string& destDir) 
     ext = archive_write_disk_new();
     archive_write_disk_set_options(ext,
         ARCHIVE_EXTRACT_TIME | ARCHIVE_EXTRACT_PERM |
-        ARCHIVE_EXTRACT_ACL | ARCHIVE_EXTRACT_FFLAGS);
+        ARCHIVE_EXTRACT_ACL  | ARCHIVE_EXTRACT_FFLAGS);
     archive_write_disk_set_standard_lookup(ext);
 
     while (true) {
@@ -133,57 +132,43 @@ bool extract_tar_xz(const std::string& archivePath, const std::string& destDir) 
         if (r < ARCHIVE_OK)
             std::cerr << "Warning: " << archive_error_string(a) << "\n";
         if (r < ARCHIVE_WARN) {
+            archive_read_close(a);
+            archive_read_free(a);
+            archive_write_close(ext);
+            archive_write_free(ext);
             return false;
         }
 
-        // -------- Implement --strip-components=1 --------
+        // --strip-components=1
         std::string path = archive_entry_pathname(entry);
         auto slashPos = path.find('/');
-        if (slashPos != std::string::npos) {
+        if (slashPos != std::string::npos)
             path = path.substr(slashPos + 1);
-        }
-        if (path.empty()) continue; // skip root entries
+        if (path.empty()) continue;
 
         std::string fullOutputPath = destDir + "/" + path;
         archive_entry_set_pathname(entry, fullOutputPath.c_str());
 
         r = archive_write_header(ext, entry);
-        if (r < ARCHIVE_OK)
-            std::cerr << "Warning: " << archive_error_string(ext) << "\n";
-        else if (archive_entry_size(entry) > 0) {
+        if (r >= ARCHIVE_OK && archive_entry_size(entry) > 0) {
             const void *buff;
             size_t size;
             la_int64_t offset;
-
             while (true) {
                 r = archive_read_data_block(a, &buff, &size, &offset);
-                if (r == ARCHIVE_EOF)
-                    break;
-                if (r < ARCHIVE_OK) {
-                    std::cerr << "Warning reading data block: "
-                              << archive_error_string(a) << "\n";
-                    break;
-                }
+                if (r == ARCHIVE_EOF) break;
+                if (r < ARCHIVE_OK) break;
                 r = archive_write_data_block(ext, buff, size, offset);
-                if (r < ARCHIVE_OK) {
-                    std::cerr << "Warning writing data block: "
-                              << archive_error_string(ext) << "\n";
-                    break;
-                }
+                if (r < ARCHIVE_OK) break;
             }
         }
-
-        r = archive_write_finish_entry(ext);
-        if (r < ARCHIVE_OK)
-            std::cerr << "Warning finish entry: "
-                      << archive_error_string(ext) << "\n";
+        archive_write_finish_entry(ext);
     }
 
     archive_read_close(a);
     archive_read_free(a);
     archive_write_close(ext);
     archive_write_free(ext);
-
     return true;
 }
 
@@ -193,12 +178,19 @@ bool extract_tar_xz(const std::string& archivePath, const std::string& destDir) 
 int main(int argc, char* argv[])
 {
     try {
-        fs::path projectRoot = fs::current_path();
-        fs::path nodeDir = projectRoot / ".node";
-        fs::create_directories(nodeDir);
+        fs::path projectRoot    = fs::current_path();
+        fs::path projectNodeDir = projectRoot / ".node";
+        fs::create_directories(projectNodeDir);
+        fs::path versionFile    = projectNodeDir / "version.txt";
 
-        fs::path versionFile = nodeDir / "version.txt";
+        // Central Store paths
+        fs::path storeDir    = fs::path(getenv("HOME")) / ".local/share/run-node";
+        fs::path archivesDir = storeDir / "archives";
+        fs::path versionsDir = storeDir / "versions";
+        fs::create_directories(archivesDir);
+        fs::create_directories(versionsDir);
 
+        // Fetch index.json
         std::string jsonStr = https_get_string("nodejs.org", "/dist/index.json");
         std::stringstream ss(jsonStr);
         boost::property_tree::ptree pt;
@@ -212,18 +204,17 @@ int main(int argc, char* argv[])
             std::cout << "Cached major version: " << cachedMajor << "\n";
         }
 
-        // Choose LTS
         for (auto& entry : pt) {
             auto& obj = entry.second;
             try {
                 bool isLTS = !obj.get<std::string>("lts").empty();
                 if (isLTS) {
-                    std::string v = obj.get<std::string>("version"); // e.g. "v20.11.1"
+                    std::string v = obj.get<std::string>("version"); // "v20.11.1"
                     int major = std::stoi(v.substr(1, v.find('.', 1) - 1));
 
                     if (cachedMajor == -1) {
                         targetVersion = v;
-                        cachedMajor = major;
+                        cachedMajor   = major;
                         std::ofstream fout(versionFile);
                         fout << major;
                         break;
@@ -242,24 +233,20 @@ int main(int argc, char* argv[])
         std::cout << "Using Node.js version: " << targetVersion << "\n";
 
         std::string filename = "node-" + targetVersion + "-linux-x64.tar.xz";
-        std::string target = "/dist/" + targetVersion + "/" + filename;
+        std::string target   = "/dist/" + targetVersion + "/" + filename;
 
-        fs::path archivePath = nodeDir / filename;
+        fs::path archivePath = archivesDir / filename;
+        fs::path extractDir  = versionsDir / targetVersion;
+        fs::path nodeBin     = extractDir / "bin" / "node";
+
         if (!fs::exists(archivePath)) {
             std::cout << "Downloading " << target << "\n";
             https_download("nodejs.org", target, archivePath);
         }
 
-        // Extracted version directory
-        fs::path versionsDir = nodeDir / "versions";
-        fs::path extractDir = versionsDir / targetVersion;
-        fs::path nodeBin = extractDir / "bin" / "node";
-
         if (!fs::exists(nodeBin)) {
-            fs::create_directories(versionsDir);
-            std::cout << "Extracting to " << extractDir << "\n";
-
             fs::create_directories(extractDir);
+            std::cout << "Extracting to " << extractDir << "\n";
             if (!extract_tar_xz(archivePath.string(), extractDir.string())) {
                 std::cerr << "Extraction failed\n";
                 return 1;
@@ -268,14 +255,26 @@ int main(int argc, char* argv[])
             std::cout << "Using cached extraction: " << extractDir << "\n";
         }
 
-        // Update symlink `.node/current` → this version
-        fs::path currentLink = nodeDir / "current";
-        if (fs::is_symlink(currentLink) || fs::exists(currentLink))
-            fs::remove(currentLink);
-        fs::create_symlink(extractDir, currentLink);
+        // --- CLEANUP PROJECT .node ---
+        for (auto& e : fs::directory_iterator(projectNodeDir)) {
+            if (e.path() == versionFile) continue; // keep physical version.txt
+            fs::remove_all(e.path());
+        }
 
-        if (!fs::exists(nodeBin)) {
-            std::cerr << "Node binary not found\n";
+        // Symlink store contents into .node (except version.txt)
+        for (auto& entry : fs::directory_iterator(extractDir)) {
+            fs::path name = entry.path().filename();
+            fs::path dest = projectNodeDir / name;
+
+            if (fs::exists(dest) || fs::is_symlink(dest))
+                fs::remove_all(dest);
+
+            fs::create_symlink(entry.path(), dest);
+        }
+
+        fs::path projectNodeBin = projectNodeDir / "bin" / "node";
+        if (!fs::exists(projectNodeBin)) {
+            std::cerr << "Node binary not found in .node/bin\n";
             return 1;
         }
 
@@ -285,13 +284,13 @@ int main(int argc, char* argv[])
         }
 
         std::vector<char*> newArgs;
-        newArgs.push_back(const_cast<char*>(nodeBin.c_str()));
+        newArgs.push_back(const_cast<char*>(projectNodeBin.c_str()));
         for (int i = 1; i < argc; i++)
             newArgs.push_back(argv[i]);
         newArgs.push_back(nullptr);
 
-        std::cout << "Running " << nodeBin << "\n";
-        execv(nodeBin.c_str(), newArgs.data());
+        std::cout << "Running " << projectNodeBin << "\n";
+        execv(projectNodeBin.c_str(), newArgs.data());
 
         perror("execv failed");
         return 1;

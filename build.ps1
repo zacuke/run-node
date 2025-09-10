@@ -1,2 +1,3 @@
-& $(if ($env:OS -eq "Windows_NT") { "wsl" }) g++ -std=c++17 run-node.cpp -o run-node -larchive -lssl -lcrypto -lboost_system -lboost_filesystem -lpthread
-& $(if ($env:OS -eq "Windows_NT") { "wsl" }) strip run-node
+$wslPrefix = if ($env:OS -eq "Windows_NT") { "wsl" } else { "" }
+& $wslPrefix g++ -std=c++17 run-node.cpp -o run-node -larchive -lssl -lcrypto -lboost_system -lboost_filesystem -lpthread
+& $wslPrefix strip run-node
