@@ -130,55 +130,73 @@ int main(int argc, char* argv[]) {
         fs::create_directories(archivesDir);
         fs::create_directories(versionsDir);
 
-        // Fetch index.json
+        // Optional pinned version
+        std::string pinnedVersion;
+        int nodeArgStart = 1; 
+
+        if (argc > 1) {
+            std::string arg1 = argv[1];
+            // crude check: starts with "v" and digit
+            if (arg1.size() > 1 && arg1[0] == 'v' && isdigit(arg1[1])) {
+                pinnedVersion = arg1;
+                nodeArgStart = 2;  // node gets args starting from argv[2]
+            }
+        }
+
+        // Fetch index.json (we still need metadata for downloading tarballs)
         std::string jsonStr = https_get_string("nodejs.org", "/dist/index.json");
         std::stringstream ss(jsonStr);
         boost::property_tree::ptree pt;
         boost::property_tree::read_json(ss, pt);
 
         std::string targetVersion;
-        int cachedMajor = -1;
-        if (fs::exists(versionFile)) {
-            std::ifstream fin(versionFile);
-            fin >> cachedMajor;
-        }
+        if (!pinnedVersion.empty()) {
+            // Just use pinned version, skip LTS logic, no update
+            targetVersion = pinnedVersion;
+            log("Pinned Node.js version: " + targetVersion);
+        } else {
+            // ---- EXISTING LTS SELECTION LOGIC ----
+            int cachedMajor = -1;
+            if (fs::exists(versionFile)) {
+                std::ifstream fin(versionFile);
+                fin >> cachedMajor;
+            }
 
-        int bestMajor = -1;
-        std::string bestVersion;
+            int bestMajor = -1;
+            std::string bestVersion;
 
-        for (auto& entry : pt) {
-            auto& obj = entry.second;
-            try {
- 
-                auto ltsOpt = obj.get_optional<std::string>("lts");
-                if (ltsOpt && *ltsOpt != "false" && !ltsOpt->empty()) { 
-                    std::string v = obj.get<std::string>("version"); // e.g. "v20.11.1"
-                    int major = std::stoi(v.substr(1, v.find('.', 1) - 1));
+            for (auto& entry : pt) {
+                auto& obj = entry.second;
+                try {
+                    auto ltsOpt = obj.get_optional<std::string>("lts");
+                    if (ltsOpt && *ltsOpt != "false" && !ltsOpt->empty()) {
+                        std::string v = obj.get<std::string>("version");
+                        int major = std::stoi(v.substr(1, v.find('.', 1) - 1));
 
-                    // If cachedMajor is set, pick the newest for that major
-                    if (cachedMajor != -1) {
-                        if (major == cachedMajor && bestVersion.empty())
-                            bestVersion = v;
-                    } else {
-                        // Otherwise, pick the highest major line
-                        if (major > bestMajor) {
-                            bestMajor = major;
-                            bestVersion = v;
+                        if (cachedMajor != -1) {
+                            if (major == cachedMajor && bestVersion.empty())
+                                bestVersion = v;
+                        } else {
+                            if (major > bestMajor) {
+                                bestMajor = major;
+                                bestVersion = v;
+                            }
                         }
                     }
-                }
-            } catch (...) {}
+                } catch (...) {}
+            }
+
+            if (cachedMajor == -1 && bestMajor != -1) {
+                cachedMajor = bestMajor;
+                std::ofstream fout(versionFile);
+                fout << cachedMajor;
+            }
+
+            targetVersion = bestVersion;
+            log("Using Node.js version: " + targetVersion);
         }
 
-        // If no cache, record chosen major
-        if (cachedMajor == -1 && bestMajor != -1) {
-            cachedMajor = bestMajor;
-            std::ofstream fout(versionFile);
-            fout << cachedMajor;
-        }
-
-        targetVersion = bestVersion;
-        log("Using Node.js version: " + targetVersion);
+        // --- rest of your logic (downloading, extracting, symlinking, installs) ---
 
         std::string filename = "node-" + targetVersion + "-linux-x64.tar.xz";
         std::string target   = "/dist/" + targetVersion + "/" + filename;
@@ -191,7 +209,6 @@ int main(int argc, char* argv[]) {
             log("Downloading " + target);
             https_download("nodejs.org", target, archivePath);
         }
-
         if (!fs::exists(nodeBin)) {
             fs::create_directories(extractDir);
             log("Extracting to " + extractDir.string());
@@ -199,22 +216,17 @@ int main(int argc, char* argv[]) {
                 log("Extraction failed");
                 return 1;
             }
-        } 
-
-        // --- CLEANUP PROJECT .node ---
-        for (auto& e : fs::directory_iterator(projectNodeDir)) {
-            if (e.path() == versionFile) continue; // keep version.txt
-            fs::remove_all(e.path());
         }
 
-        // Symlink store contents into .node
+        // cleanup `.node` contents except versionFile
+        for (auto& e : fs::directory_iterator(projectNodeDir)) {
+            if (e.path() == versionFile) continue;
+            fs::remove_all(e.path());
+        }
         for (auto& entry : fs::directory_iterator(extractDir)) {
             fs::path name = entry.path().filename();
             fs::path dest = projectNodeDir / name;
-
-            if (fs::exists(dest) || fs::is_symlink(dest))
-                fs::remove_all(dest);
-
+            if (fs::exists(dest) || fs::is_symlink(dest)) fs::remove_all(dest);
             fs::create_symlink(entry.path(), dest);
         }
 
@@ -224,7 +236,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        // Run installs if needed
+        // check for package.json
         fs::path pkgJson = projectRoot / "package.json";
         if (fs::exists(pkgJson)) {
             if (!run_corepack_install(projectNodeBin, projectNodeDir)) {
@@ -237,15 +249,15 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        if (argc < 2) {
-            log(std::string("Usage: ") + argv[0] + " <args to node>");
+        if (argc <= nodeArgStart) {
+            log(std::string("Usage: ") + argv[0] + " [vX.Y.Z] <args to node>");
             return 1;
         }
 
-        // Build argv
+        // build argv for node
         std::vector<char*> newArgs;
         newArgs.push_back(const_cast<char*>(projectNodeBin.c_str()));
-        for (int i = 1; i < argc; i++)
+        for (int i = nodeArgStart; i < argc; i++)
             newArgs.push_back(argv[i]);
         newArgs.push_back(nullptr);
 
