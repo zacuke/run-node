@@ -149,8 +149,9 @@ int main(int argc, char* argv[]) {
         for (auto& entry : pt) {
             auto& obj = entry.second;
             try {
-                std::string lts = obj.get<std::string>("lts");
-                if (!lts.empty()) { // it’s an LTS
+ 
+                auto ltsOpt = obj.get_optional<std::string>("lts");
+                if (ltsOpt && *ltsOpt != "false" && !ltsOpt->empty()) { 
                     std::string v = obj.get<std::string>("version"); // e.g. "v20.11.1"
                     int major = std::stoi(v.substr(1, v.find('.', 1) - 1));
 
