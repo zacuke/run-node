@@ -2,8 +2,7 @@ FROM ubuntu@sha256:9cbed754112939e914291337b5e554b07ad7c392491dba6daf25eef1332a2
 ENV DEBIAN_FRONTEND=noninteractive TZ=UTC
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-    cmake \
-    g++ \
+    build-essential cmake \ 
     libboost-all-dev \
     libssl-dev \
     ca-certificates \
