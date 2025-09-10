@@ -1,11 +1,11 @@
 name: Build and Release run-node
 
 on:
-  release:
-    types: [created]
+  push:
+    branches: [ master ]   # "on checkin"
 
 permissions:
-  contents: read
+  contents: write         # needed for creating release + uploading assets
   packages: write
 
 env:
@@ -14,9 +14,55 @@ env:
 
 jobs:
   # ------------------------------------------------------------
+  # Step 0: Create Release with incremented tag
+  # ------------------------------------------------------------
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create.outputs.upload_url }}
+      tag_name: ${{ steps.bump_tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get latest tag
+        id: get_tag
+        run: |
+          latest_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "latest=$latest_tag" >> $GITHUB_OUTPUT
+
+      - name: Bump Tag
+        id: bump_tag
+        run: |
+          old="${{ steps.get_tag.outputs.latest }}"
+          base="${old#v}"
+          IFS='.' read -r major minor patch <<< "$base"
+          patch=$((patch+1))
+          new="v$major.$minor.$patch"
+          echo "tag=$new" >> $GITHUB_OUTPUT
+
+      - name: Create Git tag
+        run: |
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+          git tag ${{ steps.bump_tag.outputs.tag }}
+          git push origin ${{ steps.bump_tag.outputs.tag }}
+
+      - name: Create GitHub Release
+        id: create
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.bump_tag.outputs.tag }}
+          release_name: Release ${{ steps.bump_tag.outputs.tag }}
+          draft: false
+          prerelease: false
+
+  # ------------------------------------------------------------
   # Step 1: Build & push builder images
   # ------------------------------------------------------------
   build-builder-images:
+    needs: create-release
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -51,7 +97,7 @@ jobs:
           cache-to: type=registry,ref=${{ steps.vars.outputs.CACHE }},mode=max
 
   # ------------------------------------------------------------
-  # Step 2: Compile binaries using build.sh
+  # Step 2: Compile binaries
   # ------------------------------------------------------------
   build-multi-docker:
     needs: build-builder-images
@@ -77,10 +123,10 @@ jobs:
           retention-days: 5
 
   # ------------------------------------------------------------
-  # Step 3: Release assets (matrix for all versions)
+  # Step 3: Attach binaries to the Release
   # ------------------------------------------------------------
-  release:
-    needs: build-multi-docker
+  release-assets:
+    needs: [create-release, build-multi-docker]
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -96,9 +142,9 @@ jobs:
       - name: Upload ${{ matrix.version }} asset
         uses: actions/upload-release-asset@v1
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          upload_url: ${{ github.event.release.upload_url }}
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
           asset_path: ./release-bin/run-node-ubuntu${{ matrix.version }}
           asset_name: run-node-ubuntu${{ matrix.version }}
           asset_content_type: application/octet-stream

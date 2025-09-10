@@ -13,12 +13,12 @@
 #include <sys/wait.h>
 
 namespace fs = std::filesystem;
-
+ 
 // -------------------------------------------------------------------
 // Logging helper
 // -------------------------------------------------------------------
 static void log(const std::string& msg) {
-    std::cerr << "[run-node] PID=" << getpid() << " " << msg << std::endl;
+        std::cerr <<    msg << std::endl;
 }
 
 // -------------------------------------------------------------------
@@ -27,8 +27,6 @@ static void log(const std::string& msg) {
 static bool run_process(const fs::path& exe, char* const argv[], const std::string& label) {
     pid_t pid = fork();
     if (pid == 0) {
-        // ---- CHILD ----
-        log("Child for " + label + " starting exec: " + exe.string());
         execv(exe.c_str(), argv);
         perror("[child] execv failed");
         _exit(127);
@@ -39,7 +37,6 @@ static bool run_process(const fs::path& exe, char* const argv[], const std::stri
         return false;
     }
 
-    log("Waiting for " + label + " pid=" + std::to_string(pid));
     int status;
     if (waitpid(pid, &status, 0) < 0) {
         perror("waitpid failed");
@@ -48,14 +45,11 @@ static bool run_process(const fs::path& exe, char* const argv[], const std::stri
 
     if (WIFEXITED(status)) {
         int code = WEXITSTATUS(status);
-        log(label + " exited with code " + std::to_string(code));
         return code == 0;
     } else if (WIFSIGNALED(status)) {
         int sig = WTERMSIG(status);
-        log(label + " killed by signal " + std::to_string(sig));
         return false;
     } else {
-        log(label + " ended unexpectedly");
         return false;
     }
 }
@@ -69,8 +63,6 @@ bool run_corepack_install(const fs::path& projectNodeBin, const fs::path& projec
         log("corepack.js not found at " + corepackJs.string());
         return false;
     }
-
-    log("About to run corepack install via: " + projectNodeBin.string());
 
     char* args[] = {
         const_cast<char*>(projectNodeBin.c_str()),
@@ -89,7 +81,6 @@ bool run_package_manager_install(const fs::path& projectNodeBin, const fs::path&
     fs::path pkgJson = projectRoot / "package.json";
 
     if (!fs::exists(pkgJson)) {
-        log("No package.json found, skipping dependency install.");
         return true;
     }
 
@@ -103,9 +94,6 @@ bool run_package_manager_install(const fs::path& projectNodeBin, const fs::path&
         log("packageManager not specified in package.json, defaulting to npm@latest");
         pmRef = "npm@latest";
     }
-
-    log("packageManager reference: " + pmRef);
-
     auto atPos = pmRef.find('@');
     std::string pmName = (atPos != std::string::npos) ? pmRef.substr(0, atPos) : pmRef;
     std::string pmVersion = (atPos != std::string::npos) ? pmRef.substr(atPos + 1) : "latest";
@@ -143,7 +131,6 @@ int main(int argc, char* argv[]) {
         fs::create_directories(versionsDir);
 
         // Fetch index.json
-        log("Downloading Node.js index.json");
         std::string jsonStr = https_get_string("nodejs.org", "/dist/index.json");
         std::stringstream ss(jsonStr);
         boost::property_tree::ptree pt;
@@ -154,36 +141,42 @@ int main(int argc, char* argv[]) {
         if (fs::exists(versionFile)) {
             std::ifstream fin(versionFile);
             fin >> cachedMajor;
-            log("Cached major version: " + std::to_string(cachedMajor));
         }
+
+        int bestMajor = -1;
+        std::string bestVersion;
 
         for (auto& entry : pt) {
             auto& obj = entry.second;
             try {
                 std::string lts = obj.get<std::string>("lts");
-                bool isLTS = !lts.empty();
-                if (isLTS) {
-                    std::string v = obj.get<std::string>("version"); // "v20.11.1"
+                if (!lts.empty()) { // it’s an LTS
+                    std::string v = obj.get<std::string>("version"); // e.g. "v20.11.1"
                     int major = std::stoi(v.substr(1, v.find('.', 1) - 1));
 
-                    if (cachedMajor == -1) {
-                        targetVersion = v;
-                        cachedMajor   = major;
-                        std::ofstream fout(versionFile);
-                        fout << major;
-                        break;
-                    } else if (major == cachedMajor) {
-                        targetVersion = v;
-                        break;
+                    // If cachedMajor is set, pick the newest for that major
+                    if (cachedMajor != -1) {
+                        if (major == cachedMajor && bestVersion.empty())
+                            bestVersion = v;
+                    } else {
+                        // Otherwise, pick the highest major line
+                        if (major > bestMajor) {
+                            bestMajor = major;
+                            bestVersion = v;
+                        }
                     }
                 }
             } catch (...) {}
         }
 
-        if (targetVersion.empty()) {
-            log("No suitable Node.js LTS found.");
-            return 1;
+        // If no cache, record chosen major
+        if (cachedMajor == -1 && bestMajor != -1) {
+            cachedMajor = bestMajor;
+            std::ofstream fout(versionFile);
+            fout << cachedMajor;
         }
+
+        targetVersion = bestVersion;
         log("Using Node.js version: " + targetVersion);
 
         std::string filename = "node-" + targetVersion + "-linux-x64.tar.xz";
@@ -205,9 +198,7 @@ int main(int argc, char* argv[]) {
                 log("Extraction failed");
                 return 1;
             }
-        } else {
-            log("Using cached extraction: " + extractDir.string());
-        }
+        } 
 
         // --- CLEANUP PROJECT .node ---
         for (auto& e : fs::directory_iterator(projectNodeDir)) {
@@ -256,8 +247,6 @@ int main(int argc, char* argv[]) {
         for (int i = 1; i < argc; i++)
             newArgs.push_back(argv[i]);
         newArgs.push_back(nullptr);
-
-        log("Launching Node…");
 
         bool ok = run_process(projectNodeBin, newArgs.data(), "node main");
         return ok ? 0 : 1;
