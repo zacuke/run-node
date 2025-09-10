@@ -51,7 +51,7 @@ jobs:
           cache-to: type=registry,ref=${{ steps.vars.outputs.CACHE }},mode=max
 
   # ------------------------------------------------------------
-  # Step 2: Compile binaries
+  # Step 2: Compile binaries using build.sh
   # ------------------------------------------------------------
   build-multi-docker:
     needs: build-builder-images
@@ -68,7 +68,7 @@ jobs:
           IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}:${{ matrix.version }}
           docker pull $IMAGE
           docker run --rm -v $(pwd):/src -w /src $IMAGE \
-            bash -c "g++ -std=c++17 -O2 -DNDEBUG run-node.cpp -o run-node-ubuntu${{ matrix.version }} -larchive -lssl -lcrypto -lboost_system -lboost_filesystem -lpthread && strip run-node-ubuntu${{ matrix.version }}"
+            bash -c "./build.sh && cp ./.build/run-node run-node-ubuntu${{ matrix.version }}"
 
       - uses: actions/upload-artifact@v4
         with:
