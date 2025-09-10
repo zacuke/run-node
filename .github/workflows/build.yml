@@ -23,6 +23,11 @@ jobs:
       tag_name: ${{ steps.bump_tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # fetch full history
+
+      - name: Fetch all tags
+        run: git fetch --tags
 
       - name: Get latest tag
         id: get_tag
@@ -40,12 +45,18 @@ jobs:
           new="v$major.$minor.$patch"
           echo "tag=$new" >> $GITHUB_OUTPUT
 
-      - name: Create Git tag
+      - name: Create Git tag (if new)
         run: |
           git config user.name "${{ github.actor }}"
           git config user.email "${{ github.actor }}@users.noreply.github.com"
-          git tag ${{ steps.bump_tag.outputs.tag }}
-          git push origin ${{ steps.bump_tag.outputs.tag }}
+          tag="${{ steps.bump_tag.outputs.tag }}"
+
+          if git ls-remote --tags origin | grep -q "refs/tags/$tag"; then
+            echo "Tag $tag already exists on remote, skipping creation."
+          else
+            git tag "$tag"
+            git push origin "$tag"
+          fi
 
       - name: Create GitHub Release
         id: create
