@@ -19,35 +19,123 @@ namespace fs = std::filesystem;
 // -------------------------------------------------------------------
 bool run_corepack_install(const fs::path& projectNodeBin, const fs::path& projectNodeDir)
 {
-    // corepack.js lives inside lib/node_modules/corepack/dist
     fs::path corepackJs = projectNodeDir / "lib" / "node_modules" / "corepack" / "dist" / "corepack.js";
     if (!fs::exists(corepackJs)) {
-        std::cerr << "corepack.js not found at " << corepackJs << "\n";
+        std::cerr << "[DEBUG] corepack.js not found at " << corepackJs << "\n";
         return false;
     }
 
-    std::cout << "Running corepack install with our Node...\n";
+    std::cout << "[DEBUG] About to run: " << projectNodeBin << " " << corepackJs << " install\n";
 
     pid_t pid = fork();
     if (pid == 0) {
+        // ---- CHILD ----
+        std::cerr << "[DEBUG:child] Forked successfully, PID=" << getpid() << "\n";
+
         char* args[] = {
-            const_cast<char*>(projectNodeBin.c_str()),                 // our node binary
-            const_cast<char*>(corepackJs.c_str()),                     // path to corepack.js
+            const_cast<char*>(projectNodeBin.c_str()),  // ./node
+            const_cast<char*>(corepackJs.c_str()),      // ./corepack.js
             const_cast<char*>("install"),
             nullptr
         };
+
+        // Show exec args
+        std::cerr << "[DEBUG:child] execv() with args:\n";
+        for (int i = 0; args[i] != nullptr; i++) {
+            std::cerr << "   args[" << i << "] = " << args[i] << "\n";
+        }
+
         execv(projectNodeBin.c_str(), args);
-        perror("execv corepack.js failed");
+
+        // Only reached if execv fails:
+        perror("[DEBUG:child] execv corepack.js failed");
         _exit(127);
     }
-    int status;
-    if (waitpid(pid, &status, 0) < 0) {
-        perror("waitpid failed");
+
+    // ---- PARENT ----
+    if (pid < 0) {
+        perror("[DEBUG] fork() failed");
         return false;
     }
+
+    std::cout << "[DEBUG] Waiting on child " << pid << "...\n";
+
+    int status;
+    if (waitpid(pid, &status, 0) < 0) {
+        perror("[DEBUG] waitpid failed");
+        return false;
+    }
+
+    std::cout << "[DEBUG] Child finished. Status=" << status
+              << " (WIFEXITED=" << WIFEXITED(status)
+              << ", exit=" << (WIFEXITED(status) ? WEXITSTATUS(status) : -1)
+              << ", WIFSIGNALED=" << WIFSIGNALED(status)
+              << ", signal=" << (WIFSIGNALED(status) ? WTERMSIG(status) : -1)
+              << ")\n";
+
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
+bool run_package_manager_install(const fs::path& projectNodeBin, const fs::path& projectRoot) {
+    fs::path pkgJson = projectRoot / "package.json";
 
+    if (!fs::exists(pkgJson)) {
+        std::cerr << "[DEBUG] No package.json found, skipping dependency install.\n";
+        return true;
+    }
+
+    // Parse package.json
+    boost::property_tree::ptree pt;
+    boost::property_tree::read_json(pkgJson.string(), pt);
+
+    std::string pmRef;
+    try {
+        pmRef = pt.get<std::string>("packageManager");
+    } catch (...) {
+        std::cerr << "[DEBUG] packageManager not specified in package.json.\n";
+        // fallback? npm is default
+        pmRef = "npm@latest";
+    }
+
+    std::cout << "[DEBUG] packageManager reference: " << pmRef << "\n";
+
+    auto atPos = pmRef.find('@');
+    std::string pmName = (atPos != std::string::npos) ? pmRef.substr(0, atPos) : pmRef;
+    std::string pmVersion = (atPos != std::string::npos) ? pmRef.substr(atPos + 1) : "latest";
+
+    std::cout << "[DEBUG] Will run install via: corepack " << pmName << " install\n";
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        // In child process
+        // Call node binary -> corepack.js <pmName> install
+        fs::path corepackJs = projectRoot / ".node/lib/node_modules/corepack/dist/corepack.js";
+        char* args[] = {
+            const_cast<char*>(projectNodeBin.c_str()),
+            const_cast<char*>(corepackJs.c_str()),
+            const_cast<char*>(pmName.c_str()),
+            const_cast<char*>("install"),
+            nullptr
+        };
+
+        execv(projectNodeBin.c_str(), args);
+        perror("[DEBUG:child] execv failed running package manager install");
+        _exit(127);
+    }
+
+    int status;
+    if (waitpid(pid, &status, 0) < 0) {
+        perror("[DEBUG] waitpid failed");
+        return false;
+    }
+
+    if (!(WIFEXITED(status) && WEXITSTATUS(status) == 0)) {
+        std::cerr << "[DEBUG] Package manager install failed with exit status "
+                  << (WIFEXITED(status) ? WEXITSTATUS(status) : -1) << "\n";
+        return false;
+    }
+
+    return true;
+}
 // -------------------------------------------------------------------
 // Main
 // -------------------------------------------------------------------
@@ -159,6 +247,10 @@ int main(int argc, char* argv[])
         if (fs::exists(pkgJson)) {
             if (!run_corepack_install(projectNodeBin, projectNodeDir)) {
                 std::cerr << "corepack install failed\n";
+                return 1;
+            } 
+            if (!run_package_manager_install(projectNodeBin, projectRoot)) {
+                std::cerr << "dependency install failed\n";
                 return 1;
             }
         }
